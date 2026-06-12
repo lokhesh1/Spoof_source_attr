@@ -12,7 +12,8 @@ Notes on the two non-sequence models
 -------------------------------------
 * ``xvector`` (speechbrain/spkrec-xvect-voxceleb) normally returns a single
   utterance-level embedding. To keep the CNN pipeline uniform we tap the
-  **frame-level TDNN features just before statistics pooling** (D = 1500).
+  **last 512-d TDNN frame layer** (the 512-d "last hidden state", before the
+  1500-d expansion / statistics pooling), giving a (T, 512) sequence.
 * ``wav2vec2_emo`` (speechbrain emotion model) is a fine-tuned wav2vec2; we
   return its wav2vec2 backbone's last hidden state (D = 768).
 
@@ -155,6 +156,17 @@ class SBEmotionExtractor(PTMExtractor):
 # SpeechBrain x-vector (frame-level features before statistics pooling)
 # --------------------------------------------------------------------------- #
 class SBXVectorExtractor(PTMExtractor):
+    """x-vector frame-level **512-d** last hidden state, as a (T, 512) sequence.
+
+    The TDNN frame layers are 512-d; the final block expands to 1500-d right
+    before statistics pooling. We tap the **last 512-d frame layer**, so the
+    representation is the 512-d "last hidden state" *and* still a time sequence
+    -- it flows through the same 1D-CNN + masked pool as every other PTM (the
+    temporal averaging happens after the CNN, not here).
+    """
+
+    FRAME_DIM = 512  # x-vector TDNN frame-level hidden size
+
     def __init__(self, name: str, device: str = "cpu"):
         super().__init__(name, device)
         try:
@@ -164,38 +176,32 @@ class SBXVectorExtractor(PTMExtractor):
         self.clf = EncoderClassifier.from_hparams(
             source=self.hf_id, run_opts={"device": self.device}
         )
-        # Tap the input to the statistics-pooling layer = frame-level features.
-        self._frame_feats: Optional["object"] = None
-        self._register_hook()
+        self._frame_feats = None
+        self._register_hooks()
 
-    def _register_hook(self):
-        from speechbrain.lobes.models.Xvector import Xvector  # noqa: F401
-        emb = self.clf.mods.embedding_model
-        target = None
-        for module in emb.modules():
-            # StatisticsPooling collapses the time axis; its *input* is what we want.
-            if module.__class__.__name__ == "StatisticsPooling":
-                target = module
-                break
-        if target is None:                       # fallback: hook whole model output
-            self._hook_handle = None
-            return
+    def _register_hooks(self):
+        import torch
 
-        def _pre_hook(_module, inputs):
-            self._frame_feats = inputs[0].detach()
+        def _hook(_module, _inp, out):
+            # Keep the deepest frame-level (B, T, 512) activation = the last
+            # 512-d TDNN layer, before the 1500-d expansion / statistics pooling.
+            if (isinstance(out, torch.Tensor) and out.dim() == 3
+                    and out.shape[-1] == self.FRAME_DIM and out.shape[1] > 1):
+                self._frame_feats = out.detach()
 
-        self._hook_handle = target.register_forward_pre_hook(_pre_hook)
+        for module in self.clf.mods.embedding_model.modules():
+            module.register_forward_hook(_hook)
 
     def _extract(self, waveform: np.ndarray) -> np.ndarray:
         import torch
         wav = torch.tensor(waveform, dtype=torch.float32, device=self.device).unsqueeze(0)
         self._frame_feats = None
-        emb = self.clf.encode_batch(wav)                        # triggers the hook
+        emb = self.clf.encode_batch(wav)                        # triggers the hooks
         if self._frame_feats is not None:
-            return self._frame_feats.squeeze(0).cpu().numpy()   # (T, 1500)
-        # Fallback: no pooling layer found -> tile the utterance embedding.
-        e = emb.squeeze(0).squeeze(0).cpu().numpy()             # (512,)
-        return np.tile(e[None, :], (8, 1))                      # (8, 512)
+            return self._frame_feats.squeeze(0).cpu().numpy()   # (T, 512)
+        # Fallback: tile the 512-d utterance embedding into a short sequence.
+        e = emb.reshape(-1)[: self.FRAME_DIM].cpu().numpy()     # (512,)
+        return np.tile(e[None, :], (16, 1))                     # (16, 512)
 
 
 # --------------------------------------------------------------------------- #

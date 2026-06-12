@@ -58,7 +58,7 @@ PTM_REGISTRY: Dict[str, Dict[str, Any]] = {
     "xvector": {
         "kind": "sb_xvector",
         "hf_id": "speechbrain/spkrec-xvect-voxceleb",
-        "hidden_dim": 1500,  # frame-level TDNN features (pre stats-pooling)
+        "hidden_dim": 512,  # last 512-d TDNN frame layer (kept as a sequence)
         "group": "speaker",
     },
 }
@@ -72,10 +72,10 @@ class Config:
 
     # ---- data ------------------------------------------------------------
     dataset: str = "asvspoof2019"          # 'cfad' | 'asvspoof2019'
-    asvspoof_root: str = "/home/hp/Desktop/Spoof_source_attr/LA"
+    asvspoof_root: str = "data/ASVspoof2019/LA"
     asvspoof_access: str = "LA"            # 'LA' (logical access) – standard for source attribution
     cfad_root: str = "data/CFAD"
-    include_bonafide: bool = False          # treat real/bonafide audio as an extra class
+    include_bonafide: bool = True          # treat real/bonafide audio as an extra class
     target_sr: int = 16000
     # Variable-length audio (no fixed truncation). Short clips are padded up to
     # min_duration so pooling never collapses to length 0; max_duration is an
@@ -84,7 +84,7 @@ class Config:
     max_duration: "float | None" = None
 
     # ---- feature cache ---------------------------------------------------
-    cache_dir: str = "/media/hp/36E07D91E07D57D7/cache/features"      # extracted PTM features are memoised here
+    cache_dir: str = "cache/features"      # extracted PTM features are memoised here
     use_cache: bool = True
 
     # ---- model -----------------------------------------------------------
