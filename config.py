@@ -72,7 +72,7 @@ class Config:
 
     # ---- data ------------------------------------------------------------
     dataset: str = "asvspoof2019"          # 'cfad' | 'asvspoof2019'
-    asvspoof_root: str = "data/ASVspoof2019/LA"
+    asvspoof_root: str = "/home/hp/Desktop/Spoof_source_attr/LA"
     asvspoof_access: str = "LA"            # 'LA' (logical access) – standard for source attribution
     cfad_root: str = "data/CFAD"
     include_bonafide: bool = True          # treat real/bonafide audio as an extra class
@@ -84,7 +84,7 @@ class Config:
     max_duration: "float | None" = None
 
     # ---- feature cache ---------------------------------------------------
-    cache_dir: str = "cache/features"      # extracted PTM features are memoised here
+    cache_dir: str = "./cache/features"      # extracted PTM features are memoised here
     use_cache: bool = True
 
     # ---- model -----------------------------------------------------------
@@ -98,7 +98,7 @@ class Config:
     rd_symmetric: bool = True              # average D(p||q) and D(q||p)
 
     # ---- optimisation ----------------------------------------------------
-    epochs: int = 50
+    epochs: int = 23
     batch_size: int = 32
     lr: float = 1e-3
     weight_decay: float = 1e-4
