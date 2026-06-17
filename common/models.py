@@ -1,22 +1,30 @@
 """Neural network components for ADSA.
 
-Pipeline per PTM representation (steps 2-3 of the spec), now **length-agnostic**::
+Two downstream front-ends, each matching the reference paper.
 
-    features (B, T, D)          # variable T -- no fixed 4 s truncation
-      -> transpose -> (B, D, T)
-      -> Conv1d(D  -> 256, k=3, pad=1) -> ReLU -> MaxPool1d(2)
-      -> Conv1d(256-> 128, k=3, pad=1) -> ReLU -> MaxPool1d(2)
-      -> masked global average pool over time   -> (B, 128)
-      -> Linear(128 -> proj_dim=120)            # the per-PTM embedding
+**Single-PTM trial** (``SinglePTMModel`` -> ``PooledCNNFrontEnd``) -- the PTM
+last hidden state is average-pooled over time *before* the CNN (paper Appendix
+A.2), so the 1D conv slides along the feature axis of the pooled vector::
 
-The conv stack is length-agnostic; variable-length clips are zero-padded per
-batch and the trailing padded frames are *masked out* of the average pool, so
-no temporal information is discarded and padding never biases the embedding.
-``LazyConv1d`` still infers the in-channels (D), so the same code works for
-every PTM (it must see one forward pass before the optimizer is built --
-see common.engine.materialize_lazy).
+    features (B, T, D)
+      -> masked average pool over time          -> (B, D)         # pool FIRST
+      -> (B, 1, D)                                                 # D = conv length, 1 channel
+      -> Conv1d(1  -> 256, k=3, pad=1) -> BN -> ReLU -> MaxPool1d(2)
+      -> Conv1d(256-> 128, k=3, pad=1) -> BN -> ReLU -> MaxPool1d(2)
+      -> flatten                                -> (B, 128 * (D//4))
+      -> FCN: 256 -> 128 -> 64 -> num_classes   (logits; softmax at inference)
 
-FCN (step 4)::  embed -> 256 -> 128 -> 64 -> num_classes   (logits; softmax at inference)
+There is no global temporal pool or 120-d projection in the single trail -- the
+conv output is flattened straight into the FCN, exactly as the paper describes.
+
+**Fusion trial** (``FusionModel`` -> ``CNNFrontEnd``) -- length-agnostic
+*sequence* conv (conv over time, masked temporal pool, Linear -> 120), kept as
+the FINDER design. The padded tail is re-zeroed after every conv so a clip's
+embedding is invariant to how much padding its batch-mates force.
+
+``LazyConv1d`` / ``LazyLinear`` infer their input sizes, so the same code works
+for every PTM (one forward pass must run before the optimizer is built -- see
+common.engine.materialize_lazy).
 """
 from __future__ import annotations
 
@@ -92,15 +100,21 @@ class CNNFrontEnd(nn.Module):
 
 
 class FCN(nn.Module):
-    """Three dense layers (256, 128, 64) + a classification layer."""
+    """Three dense layers (256, 128, 64) + a classification layer.
 
-    def __init__(self, in_dim: int, num_classes: int,
+    Pass ``in_dim=None`` to make the first layer ``nn.LazyLinear`` so the input
+    width is inferred on the first forward pass -- used by the single-PTM model,
+    whose flattened conv width (128 * D//4) depends on the PTM hidden size.
+    """
+
+    def __init__(self, in_dim: "int | None", num_classes: int,
                  dims: Sequence[int] = (256, 128, 64), dropout: float = 0.0):
         super().__init__()
         layers = []
         prev = in_dim
-        for h in dims:
-            layers += [nn.Linear(prev, h), nn.ReLU(inplace=True)]
+        for i, h in enumerate(dims):
+            first = nn.LazyLinear(h) if (i == 0 and in_dim is None) else nn.Linear(prev, h)
+            layers += [first, nn.ReLU(inplace=True)]
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             prev = h
@@ -111,20 +125,48 @@ class FCN(nn.Module):
         return self.classifier(self.backbone(x))
 
 
-class SinglePTMModel(nn.Module):
-    """Trial 1: one PTM representation -> CNN -> 120-d embedding -> FCN."""
+class PooledCNNFrontEnd(nn.Module):
+    """Paper-faithful single-trail front-end: average-pool over time *first*,
+    then two 1D-conv blocks over the feature axis, then flatten.
 
-    def __init__(self, num_classes: int, proj_dim: int = 120,
+    The PTM last hidden state is masked-averaged over the valid time steps to a
+    (B, D) vector (paper Appendix A.2), which is treated as a length-D,
+    single-channel signal. Each conv block is Conv -> BatchNorm -> ReLU ->
+    MaxPool(2); the result is flattened (no global temporal pool, no 120-d
+    projection -- those belong to the FINDER fusion design only).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv1d(1, 256, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.conv2 = nn.Conv1d(256, _CONV2_CHANNELS, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(_CONV2_CHANNELS)
+        self.pool = nn.MaxPool1d(2)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        # (B, T, D) -> (B, D, T); average over the valid frames -> (B, D)
+        rep = masked_mean(x.transpose(1, 2), lengths.clamp(min=1))   # (B, D)
+        h = rep.unsqueeze(1)                                         # (B, 1, D)
+        h = self.pool(torch.relu(self.bn1(self.conv1(h))))          # (B, 256, D//2)
+        h = self.pool(torch.relu(self.bn2(self.conv2(h))))          # (B, 128, D//4)
+        return torch.flatten(h, 1)                                  # (B, 128 * (D//4))
+
+
+class SinglePTMModel(nn.Module):
+    """Trial 1: one PTM representation -> avg-pool -> CNN -> flatten -> FCN."""
+
+    def __init__(self, num_classes: int,
                  fcn_dims: Sequence[int] = (256, 128, 64), dropout: float = 0.0):
         super().__init__()
-        self.frontend = CNNFrontEnd(proj_dim)
-        self.fcn = FCN(proj_dim, num_classes, fcn_dims, dropout)
+        self.frontend = PooledCNNFrontEnd()
+        self.fcn = FCN(None, num_classes, fcn_dims, dropout)   # lazy in_dim = 128 * D//4
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        emb = self.frontend(x, lengths)     # (B, 120)
-        logits = self.fcn(emb)              # (B, num_classes)
-        return logits, emb
+        feat = self.frontend(x, lengths)    # (B, 128 * D//4)
+        logits = self.fcn(feat)             # (B, num_classes)
+        return logits, feat
 
 
 class FusionModel(nn.Module):
