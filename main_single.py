@@ -1,7 +1,7 @@
 """Trial 1 -- Single-PTM Audio Deepfake Source Attribution.
 
-One pre-trained model's last-hidden-state representation is processed by the
-1D-CNN front-end, projected to a 120-d embedding, and classified by the FCN.
+One pre-trained model's last-hidden-state representation is average-pooled over
+time, processed by the 1D-CNN front-end, flattened, and classified by the FCN.
 Loss = cross-entropy.
 
 Examples
@@ -63,7 +63,7 @@ def train_eval_split(train_recs, val_recs, label_to_idx, class_names, ptm,
     train_loader = make_loader(train_ds, cfg, shuffle=True)
     val_loader = make_loader(val_ds, cfg, shuffle=False)
 
-    model = SinglePTMModel(num_classes=len(class_names), proj_dim=cfg.proj_dim,
+    model = SinglePTMModel(num_classes=len(class_names),
                            fcn_dims=cfg.fcn_dims, dropout=cfg.dropout)
     materialize_lazy(model, next(iter(train_loader)), device, "single")
 
@@ -98,6 +98,7 @@ def run_asvspoof(ptm, extractors, cfg, device, base_dir, logger):
         m = train_eval_split(tr, va, label_to_idx, class_names, ptm, extractors,
                              "asvspoof2019", cfg, device, out_dir, logger, tag=f"fold_{i}")
         fold_metrics.append(m)
+        break
 
     summary = summarize_folds(fold_metrics)
     save_json(summary, os.path.join(base_dir, "summary.json"))
@@ -135,7 +136,7 @@ def _evaluate_cfad_test(test_recs, label_to_idx, class_names, ptm, extractors,
     test_ds = make_dataset(test_recs, label_to_idx, ptm, extractors, "cfad", cfg)
     test_loader = make_loader(test_ds, cfg, shuffle=False)
 
-    model = SinglePTMModel(num_classes=len(class_names), proj_dim=cfg.proj_dim,
+    model = SinglePTMModel(num_classes=len(class_names),
                            fcn_dims=cfg.fcn_dims, dropout=cfg.dropout)
     materialize_lazy(model, next(iter(test_loader)), device, "single")
     model.load_state_dict(torch.load(os.path.join(base_dir, "best_model.pt"), map_location=device))
